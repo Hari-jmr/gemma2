@@ -21,12 +21,12 @@ class Encoder:
         return vectors
 
 
-def sample_pdf():
+def sample_pdf(lines=('Paris is the capital of France.', 'Bananas are yellow.')):
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer)
-    pdf.drawString(72, 720, 'Paris is the capital of France.')
-    pdf.showPage()
-    pdf.drawString(72, 720, 'Bananas are yellow.')
+    for n, line in enumerate(lines):
+        pdf.drawString(72, 720 - 20 * n, line)
+        pdf.showPage()
     pdf.save()
     return buffer.getvalue()
 
@@ -34,7 +34,9 @@ def sample_pdf():
 @pytest.fixture
 def database(monkeypatch):
     # Use an isolated schema, never remove user document tables.
-    url = os.getenv('TEST_DATABASE_URL', db.DEFAULT_DATABASE_URL)
+    url = os.getenv('TEST_DATABASE_URL') or os.getenv('DATABASE_URL')
+    if not url:
+        pytest.skip("Set TEST_DATABASE_URL or DATABASE_URL to run database tests.")
     schema = 'rag_test_' + uuid.uuid4().hex
     with psycopg.connect(url, autocommit=True) as connection:
         connection.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(schema)))
@@ -61,9 +63,9 @@ def test_real_pdf_postgres_retrieval_and_chat(tmp_path, monkeypatch, database):
     assert source['score'] == pytest.approx(1)
     monkeypatch.setenv('LLM_API_KEY', 'test-key')
     monkeypatch.setenv('LLM_MODEL', 'test-model')
-    monkeypatch.setenv('LLM_BASE_URL', 'https://openrouter.ai/api/v1')
+    monkeypatch.setenv('LLM_BASE_URL', 'http://llm.invalid/v1')
     def api(url, **kwargs):
-        assert url == 'https://openrouter.ai/api/v1/chat/completions'
+        assert url == 'http://llm.invalid/v1/chat/completions'
         assert 'Paris' in kwargs['json']['messages'][1]['content']
         import httpx
         return httpx.Response(200, json={'choices': [{'message': {'content': 'Paris [1].'}}]}, request=httpx.Request('POST', url))
@@ -144,3 +146,27 @@ def test_pymupdf_page_numbers_and_ocr_constraint(tmp_path):
 def test_chunk_overlap():
     assert [len(c) for c in chunk_text('x' * 3000)] == [1600, 1600, 200]
     assert chunk_text('   ') == []
+
+
+def test_batch_upload_and_cross_document_retrieval(tmp_path, monkeypatch, database):
+    monkeypatch.setattr(main, 'DATA', tmp_path)
+    monkeypatch.setattr(main, 'encoder', Encoder())
+    client = TestClient(main.app)
+    response = client.post('/documents?parser=pymupdf', files=[
+        ('file', ('city.pdf', sample_pdf(), 'application/pdf')),
+        ('file', ('fruit.pdf', sample_pdf(('The banana is a fruit.',)), 'application/pdf'))])
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(body['documents']) == 2
+    ids = [d['document_id'] for d in body['documents']]
+    sources = client.post('/retrieve', json={'document_ids': ids, 'question': 'What is the capital?', 'top_k': 5}).json()['sources']
+    assert {s['filename'] for s in sources} == {'city.pdf', 'fruit.pdf'}
+    assert sources[0]['filename'] == 'city.pdf' and 'Paris' in sources[0]['text']
+    single = client.post('/retrieve', json={'document_ids': ids[:1], 'question': 'What is the capital?', 'top_k': 5}).json()['sources']
+    assert sources and all(s['filename'] == 'city.pdf' for s in single)
+
+
+def test_query_requires_documents():
+    client = TestClient(main.app)
+    assert client.post('/retrieve', json={'question': 'hello'}).status_code == 422
+    assert client.post('/retrieve', json={'document_ids': ['../x'], 'question': 'hello'}).status_code == 422

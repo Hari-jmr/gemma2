@@ -1,17 +1,26 @@
 """Transactional document storage and exact cosine retrieval with pgvector."""
 import os
+from pathlib import Path
 
 import numpy as np
 import psycopg
+from dotenv import load_dotenv
 from pgvector.psycopg import register_vector
 from psycopg.rows import dict_row
 
-DEFAULT_DATABASE_URL = "postgresql://rag@127.0.0.1:5433/rag"
 DIMENSIONS = 768
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+
+def database_url():
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL is not configured. Set it in the .env file.")
+    return url
 
 
 def connect():
-    connection = psycopg.connect(os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL), connect_timeout=5)
+    connection = psycopg.connect(database_url(), connect_timeout=5)
     try:
         register_vector(connection)
     except Exception:
@@ -21,7 +30,7 @@ def connect():
 
 
 def initialize():
-    with psycopg.connect(os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL), connect_timeout=5) as connection:
+    with psycopg.connect(database_url(), connect_timeout=5) as connection:
         connection.execute("CREATE EXTENSION IF NOT EXISTS vector")
         connection.execute("""CREATE TABLE IF NOT EXISTS rag_documents (
             id UUID PRIMARY KEY,
@@ -30,6 +39,8 @@ def initialize():
             embedding_model TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )""")
+        connection.execute("ALTER TABLE rag_documents ADD COLUMN IF NOT EXISTS sha256 TEXT")
+        connection.execute("CREATE INDEX IF NOT EXISTS rag_documents_sha256_idx ON rag_documents (sha256)")
         connection.execute(f"""CREATE TABLE IF NOT EXISTS rag_chunks (
             document_id UUID NOT NULL REFERENCES rag_documents(id) ON DELETE CASCADE,
             ordinal INTEGER NOT NULL,
@@ -47,31 +58,43 @@ def checked_vector(vector):
     return result
 
 
-def save_document(document_id, filename, parser, embedding_model, chunks, vectors):
+def find_document_by_hash(sha256):
+    with connect() as connection:
+        row = connection.execute("SELECT id FROM rag_documents WHERE sha256 = %s", (sha256,)).fetchone()
+        return str(row[0]) if row else None
+
+
+def save_document(document_id, filename, parser, embedding_model, chunks, vectors, sha256=None):
     if len(chunks) != len(vectors):
         raise ValueError("Chunk count does not match embedding count.")
     rows = [(document_id, n, chunk["page"], chunk["text"], checked_vector(vector))
             for n, (chunk, vector) in enumerate(zip(chunks, vectors))]
     with connect() as connection:
-        connection.execute("INSERT INTO rag_documents (id, filename, parser, embedding_model) VALUES (%s, %s, %s, %s)",
-                           (document_id, filename, parser, embedding_model))
+        connection.execute("DELETE FROM rag_documents WHERE id = %s", (document_id,))
+        connection.execute("INSERT INTO rag_documents (id, filename, parser, embedding_model, sha256) VALUES (%s, %s, %s, %s, %s)",
+                           (document_id, filename, parser, embedding_model, sha256))
         with connection.cursor() as cursor:
             cursor.executemany("INSERT INTO rag_chunks (document_id, ordinal, page, content, embedding) VALUES (%s, %s, %s, %s, %s)", rows)
 
 
-def search(document_id, vector, top_k, embedding_model):
+def search(document_ids, vector, top_k, embedding_model):
+    if isinstance(document_ids, str):
+        document_ids = [document_ids]
+    requested = list(dict.fromkeys(str(item) for item in document_ids))
     vector = checked_vector(vector)
     with connect() as connection:
-        document = connection.execute("SELECT filename, embedding_model FROM rag_documents WHERE id = %s", (document_id,)).fetchone()
-        if document is None:
+        documents = connection.execute("SELECT id, filename, embedding_model FROM rag_documents WHERE id = ANY(%s::uuid[])", (requested,)).fetchall()
+        names = {str(row[0]): row[1] for row in documents}
+        if len(names) != len(requested):
             raise LookupError("Document not found or indexing incomplete.")
-        if document[1] != embedding_model:
-            raise ValueError("The embedding model changed. Re-index this PDF before searching.")
+        if any(row[2] != embedding_model for row in documents):
+            raise ValueError("The embedding model changed. Re-index these PDFs before searching.")
         with connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute("""SELECT page, content AS text, 1 - (embedding <=> %s) AS score
-                FROM rag_chunks WHERE document_id = %s
-                ORDER BY embedding <=> %s, ordinal LIMIT %s""", (vector, document_id, vector, top_k))
-            return [{**row, "score": float(row["score"]), "filename": document[0], "source": n + 1}
+            cursor.execute("""SELECT c.document_id, c.page, c.content AS text, 1 - (c.embedding <=> %s) AS score
+                FROM rag_chunks c WHERE c.document_id = ANY(%s::uuid[])
+                ORDER BY c.embedding <=> %s, c.ordinal LIMIT %s""", (vector, requested, vector, top_k))
+            return [{**row, "document_id": str(row["document_id"]), "score": float(row["score"]),
+                     "filename": names[str(row["document_id"])], "source": n + 1}
                     for n, row in enumerate(cursor.fetchall())]
 
 
